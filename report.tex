@@ -1,0 +1,325 @@
+\documentclass[12pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage{amsmath}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{parskip}
+\usepackage{enumitem}
+\usepackage{multirow}
+
+\hypersetup{colorlinks=true, linkcolor=blue!60!black, citecolor=blue!60!black, urlcolor=blue!60!black}
+
+\title{\LARGE\textbf{Do Negative Airbnb Reviews Reflect Bad Quality\\or Simply a Bad Fit?}\\[0.5em]
+\large A Data-Driven Analysis of 2 Million London Reviews\\Using NLP and GPU-Accelerated Machine Learning}
+
+\author{Abhinav Bijpuria \and Marta Trales \and Rares Olteanu}
+\date{May 2026}
+
+\begin{document}
+\maketitle
+
+% ============================================================
+\begin{abstract}
+Not every negative Airbnb review means something is wrong with the property.
+Sometimes the listing is perfectly fine, but it just was not the right match for that particular guest.
+For example, a small city-centre studio might score five stars from solo travellers but receive complaints from a family of four.
+
+In this project we analyse \textbf{2,097,996 Airbnb reviews from London} to find out how often a negative review signals a real quality problem (like dirt or broken equipment) versus a \emph{mismatch} between the guest's expectations and what the listing actually offers (like the room being too small or the neighbourhood being too noisy for their taste).
+
+We combine rule-based keyword detection with a \textbf{GPU-accelerated neural network} that achieves \textbf{87\% accuracy} at classifying ambiguous reviews.
+Our main finding: among the 105,365 negative reviews, roughly \textbf{51\% point to genuine deficiencies} while \textbf{38\% are better explained as a mismatch}, which suggests that a large share of negative feedback could be addressed through better listing descriptions rather than property improvements.
+\end{abstract}
+
+% ============================================================
+\section{Introduction}
+
+Airbnb hosts live and die by their review scores.
+A string of negative reviews can push a listing down in search results, reduce bookings, and ultimately cost the host money.
+But what if many of those negative reviews are not really about the quality of the listing at all?
+
+Consider two situations:
+\begin{itemize}[nosep]
+    \item \textbf{Quality deficiency:} The bathroom has mould, the WiFi does not work, and the host never replies to messages. These are real problems that need fixing.
+    \item \textbf{Mismatch:} The flat is clean, well-maintained, and the host is friendly --- but a guest complains that the neighbourhood is ``too far from the centre'' or the room is ``too small.'' The listing was not a good match for that guest, but there is nothing actually wrong with it.
+\end{itemize}
+
+Telling these two cases apart matters.
+If a host is getting complaints about dirt, they need to clean better.
+If guests keep saying the room is small, the host might just need to add clearer photos and a note about the room size in the description.
+
+In this report we build a system that reads every negative review, figures out which aspects the guest is complaining about, checks the listing's overall quality scores, and assigns a label: \emph{deficiency}, \emph{mismatch}, \emph{mixed}, or \emph{unclear}.
+For the many reviews that are hard to classify with simple rules, we train a neural network on the GPU to make a final decision.
+
+% ============================================================
+\section{Data}
+
+We use the publicly available \textbf{Inside Airbnb} dataset for London, scraped in September 2025.
+The main file (\texttt{notes.csv}) is a pre-merged table that joins every review with its parent listing's metadata.
+
+\begin{table}[H]
+\centering
+\caption{Dataset overview}
+\begin{tabular}{lr}
+\toprule
+\textbf{Metric} & \textbf{Value} \\
+\midrule
+Total reviews          & 2,097,996 \\
+Unique listings        & 32,021 \\
+Negative reviews (VADER $\leq$ --0.05) & 105,365\,(5.0\%) \\
+File size              & 6\,GB (89 columns) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Each row contains the review text, reviewer ID, listing ID, room type, price, host response rate, superhost status, and six review-score dimensions (rating, accuracy, cleanliness, communication, location, value).
+
+% ============================================================
+\section{Method}
+
+Our pipeline has four main stages.
+
+\subsection{Stage 1 --- Sentiment Scoring with VADER}
+
+We first need to decide which reviews are negative.
+We use \textbf{VADER} (Valence Aware Dictionary and sEntiment Reasoner), a well-known tool that gives every piece of text a \emph{compound score} between --1 (very negative) and +1 (very positive).
+
+Any review with a compound score of \textbf{--0.05 or below} is treated as negative.
+This threshold is intentionally lenient so that we catch mildly negative reviews too, not just strongly angry ones.
+
+Out of nearly 2.1 million reviews, \textbf{105,365 (5.0\%)} are flagged as negative.
+
+\subsection{Stage 2 --- Aspect Tagging with Keyword Patterns}
+
+Next, we identify \emph{what} the guest is complaining about.
+We define eight aspect categories, each with a list of keywords, and scan every negative review for matches.
+
+\begin{table}[H]
+\centering
+\caption{Aspect categories and example keywords}
+\begin{tabular}{llp{7cm}}
+\toprule
+\textbf{Type} & \textbf{Aspect} & \textbf{Example keywords} \\
+\midrule
+\multirow{4}{*}{\rotatebox{90}{\small Quality}}
+& Cleanliness     & dirty, filthy, mould, smell, stain, bugs \\
+& Maintenance     & broken, leak, heating, WiFi, bedbug, repair \\
+& Host service    & rude, unresponsive, late, cancelled, keys \\
+& Accuracy/Safety & misleading, not as described, unsafe, scam \\
+\midrule
+\multirow{4}{*}{\rotatebox{90}{\small Mismatch}}
+& Location fit    & far, commute, tube, central, zone, area \\
+& Space fit       & small, tiny, cramped, narrow, stairs \\
+& Value fit       & expensive, overpriced, not worth, cost \\
+& Preference fit  & noisy, loud, hot, cold, dark, firm bed \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+We use regex word-boundary matching (\verb|\b|) with non-capturing groups so that ``location'' matches but ``relocation'' does not.
+
+\subsection{Stage 3 --- Rule-Based Classification}
+
+For each negative review, we compute two scores:
+
+\begin{itemize}[nosep]
+    \item A \textbf{deficiency score} that goes up when quality-related keywords appear, the listing has low review scores in the relevant dimension, or similar complaints keep showing up from other guests at the same listing.
+    \item A \textbf{mismatch score} that goes up when preference/fit keywords appear but the listing actually has \emph{high} quality scores (meaning other guests were happy --- this guest just was not the right audience).
+\end{itemize}
+
+The label is then assigned by comparing the two scores:
+
+\begin{table}[H]
+\centering
+\caption{Labelling rules}
+\begin{tabular}{lp{9cm}}
+\toprule
+\textbf{Label} & \textbf{Rule} \\
+\midrule
+Deficiency & Deficiency score $\geq$ mismatch score $+$ 1 \\
+Mismatch   & Mismatch score $\geq$ deficiency score $+$ 1 \\
+Mixed      & Both scores $>$ 0 but neither dominates \\
+Unclear    & Negative review but no strong signal either way \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+At this stage, a large share of reviews (\textbf{68.3\%}) land in the ``unclear'' bucket --- they are negative but do not contain enough keywords for a confident rule-based decision.
+This is where the neural network comes in.
+
+\subsection{Stage 4 --- GPU-Accelerated Neural Text Classifier}
+
+To resolve the unclear reviews, we train a \textbf{PyTorch multi-layer perceptron (MLP)} on the GPU (NVIDIA GeForce RTX 3050).
+
+\begin{enumerate}[nosep]
+    \item \textbf{Feature extraction:} We convert each review into a numerical vector using TF-IDF (Term Frequency--Inverse Document Frequency) with up to 10,000 features and bigrams.
+    \item \textbf{Training data:} The 29,282 reviews that the rule-based step labelled as either ``deficiency'' or ``mismatch'' serve as the training set (80/20 train/test split).
+    \item \textbf{Architecture:} A three-layer MLP (10,000 $\rightarrow$ 256 $\rightarrow$ 128 $\rightarrow$ 2) with ReLU activations and dropout, trained for 15 epochs with Adam optimiser.
+    \item \textbf{Prediction:} The model predicts a probability for each unclear review. If the model is at least \textbf{70\% confident}, we accept its label; otherwise the review stays ``unclear.''
+\end{enumerate}
+
+\begin{table}[H]
+\centering
+\caption{GPU model performance on the held-out test set}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Class} & \textbf{Precision} & \textbf{Recall} & \textbf{F1-Score} \\
+\midrule
+Deficiency & 0.908 & 0.893 & 0.901 \\
+Mismatch   & 0.797 & 0.823 & 0.810 \\
+\midrule
+\textbf{Overall accuracy} & \multicolumn{3}{c}{\textbf{86.96\%}} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The model successfully relabelled \textbf{64,602 out of 71,999} unclear reviews (89.7\%), leaving only 7.0\% still unresolved.
+
+% ============================================================
+\section{Results}
+
+\subsection{Label Distribution}
+
+After combining rule-based labels with the GPU model's predictions, the final distribution of the 105,365 negative reviews is:
+
+\begin{table}[H]
+\centering
+\caption{Final (expanded) label distribution}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Label} & \textbf{Count} & \textbf{Share} \\
+\midrule
+Deficiency & 54,024 & 51.27\% \\
+Mismatch   & 39,860 & 37.83\% \\
+Mixed      & 4,084  & 3.88\% \\
+Unclear    & 7,397  & 7.02\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The key takeaway: \textbf{nearly 38\% of all negative reviews are better explained as a mismatch} rather than a quality problem.
+This is a substantial share that hosts could address through better listing descriptions, clearer photos, or setting guest expectations upfront.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.75\textwidth]{figures/label_distribution_comparison.png}
+\caption{Comparison of rule-based labels (left bars) vs.\ expanded labels after the GPU model fills in unclear cases (right bars). The model dramatically reduces the ``unclear'' category.}
+\end{figure}
+
+\subsection{Labels by Room Type}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.75\textwidth]{figures/room_type_label_mix.png}
+\caption{Stacked label proportions by room type. Hotel rooms have the highest deficiency share, while private rooms show a higher mismatch proportion.}
+\end{figure}
+
+\begin{table}[H]
+\centering
+\caption{Negative review counts by room type and expanded label}
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Room type} & \textbf{Deficiency} & \textbf{Mismatch} & \textbf{Mixed} & \textbf{Unclear} \\
+\midrule
+Entire home/apt & 32,079 & 22,127 & 2,752 & 4,090 \\
+Private room    & 21,466 & 17,451 & 1,297 & 3,252 \\
+Hotel room      & 175    & 103    & 19    & 18 \\
+Shared room     & 304    & 179    & 16    & 37 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Aspect Analysis}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\textwidth]{figures/aspect_heatmap.png}
+\caption{Heatmap showing how often each aspect keyword appears in reviews of each label type. ``Mixed'' reviews have the highest keyword density across all aspects.}
+\end{figure}
+
+The heatmap confirms our intuition:
+\begin{itemize}[nosep]
+    \item \textbf{Deficiency} reviews talk most about \emph{host service} (20.2\%), \emph{maintenance} (14.4\%), and \emph{cleanliness} (11.7\%).
+    \item \textbf{Mismatch} reviews focus on \emph{location fit} (17.2\%), \emph{preference fit} (9.4\%), and \emph{space fit} (7.9\%).
+    \item \textbf{Mixed} reviews mention both types heavily, with \emph{location fit} at 72.2\% and \emph{maintenance} at 41.9\%.
+\end{itemize}
+
+\subsection{Listing Quality by Label}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.65\textwidth]{figures/avg_listing_rating_by_label.png}
+\caption{Listings associated with ``mismatch'' reviews tend to have \emph{higher} average ratings than those with ``deficiency'' reviews, supporting the interpretation that these are good properties that simply did not suit the guest.}
+\end{figure}
+
+This is an important validation: listings labelled as ``mismatch'' have higher average ratings than those labelled as ``deficiency.''
+This makes sense --- a listing with consistently high ratings that still gets the occasional negative review is more likely experiencing a fit issue than a quality issue.
+
+\subsection{Word Analysis}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{figures/word_clouds.png}
+\caption{Word clouds for all reviews (left), negative reviews (centre), and non-negative reviews (right).}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\textwidth]{figures/top_words_positive_negative.png}
+\caption{Top filtered tokens in negative vs.\ non-negative reviews. Negative reviews prominently feature words like ``check,'' ``night,'' ``time,'' and ``bathroom,'' while positive reviews feature ``clean,'' ``location,'' and ``recommend.''}
+\end{figure}
+
+% ============================================================
+\section{Technical Setup}
+
+All computation was performed on a single laptop:
+
+\begin{table}[H]
+\centering
+\caption{Hardware and software environment}
+\begin{tabular}{ll}
+\toprule
+\textbf{Component} & \textbf{Details} \\
+\midrule
+GPU     & NVIDIA GeForce RTX 3050 Laptop (4\,GB VRAM) \\
+CUDA    & 12.4 (via PyTorch) \\
+cuDNN   & 9.1 \\
+Python  & 3.11 (Miniconda) \\
+PyTorch & 2.6.0+cu124 \\
+Key libraries & scikit-learn, VADER, pandas, matplotlib \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The GPU was used for training and inference of the neural text classifier.
+The entire pipeline --- loading 6\,GB of data, scoring 2.1 million reviews with VADER, tagging aspects, running the rule-based classifier, and training the neural network --- completes in approximately \textbf{22 minutes} on this hardware.
+
+% ============================================================
+\section{Limitations}
+
+\begin{itemize}[nosep]
+    \item \textbf{VADER is rule-based.} It works well for English but misses sarcasm and performs poorly on non-English reviews (the London dataset contains reviews in French, German, Spanish, and other languages).
+    \item \textbf{Keyword lists are hand-crafted.} We may miss relevant aspects or include terms that are too broad (e.g.\ ``hot'' could mean weather or a compliment).
+    \item \textbf{The neural model trains on rule-based labels.} Since the training data comes from our own rules, the model inherits any biases in those rules.
+    \item \textbf{4\,GB VRAM limits model size.} With more GPU memory, we could use transformer-based models (like BERT) which would likely improve accuracy further.
+\end{itemize}
+
+% ============================================================
+\section{Conclusion}
+
+We built a complete pipeline that reads 2.1 million Airbnb reviews, identifies the 5\% that are negative, and classifies each one as either a quality deficiency or a guest--listing mismatch.
+
+The main finding is that \textbf{nearly 4 in 10 negative reviews} are not about the property being bad --- they are about it being the wrong fit for that guest.
+This has a practical implication: hosts receiving mismatch-type complaints might benefit more from improving their listing description (being honest about room size, distance from transport, noise levels) than from expensive renovations.
+
+For Airbnb as a platform, separating mismatch from deficiency could lead to fairer review systems that distinguish between ``this place has problems'' and ``this place was not for me.''
+
+\end{document}
